@@ -25,7 +25,7 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  if (port < 1 || port > 65535) {
+  if (port < 1023 || port > 65535) {
     std::cerr << "Provided port: " << argv[1] << " is not a valid port number"
               << "\n";
     return 1;

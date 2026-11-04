@@ -2,14 +2,52 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <netinet/in.h>
+#include <string>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 ///////////////////////////////////////////////////////////////////////////////
+/// HELPERS
+bool sendLine(int sock, const std::string& text);
+bool isValidUsername(const std::string& name);
+bool askUsername(const std::string& prompt, std::string& out);
+bool askSubject(std::string& out);
+
+///////////////////////////////////////////////////////////////////////////////
+/// HANDLERS
+bool handleSend(int sock);
+// TODO:
+// - handleList
+// - handleSend
+// - handleDel
+
+///////////////////////////////////////////////////////////////////////////////
 
 constexpr int BUF = 1024;
+
+///////////////////////////////////////////////////////////////////////////////
+
+enum Commands { SEND, LIST, READ, DEL, QUIT };
+
+std::string commandToString(Commands command);
+std::string commandToString(Commands command) {
+  switch (command) {
+  case SEND:
+    return "SEND";
+  case LIST:
+    return "LIST";
+  case READ:
+    return "READ";
+  case DEL:
+    return "DEL";
+  case QUIT:
+    return "QUIT";
+  }
+  return "";
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -104,25 +142,23 @@ int main(int argc, char** argv) {
         --size;
         buffer[size] = 0;
       }
-      isQuit = strcmp(buffer, "quit") == 0;
 
-      //////////////////////////////////////////////////////////////////////
-      // SEND DATA
-      // https://man7.org/linux/man-pages/man2/send.2.html
-      // send will fail if connection is closed, but does not set
-      // the error of send, but still the count of bytes sent
-      if ((send(create_socket, buffer, size + 1, 0)) == -1) {
-        // in case the server is gone offline we will still not enter
-        // this part of code: see docs: https://linux.die.net/man/3/send
-        // >> Successful completion of a call to send() does not guarantee
-        // >> delivery of the message. A return value of -1 indicates only
-        // >> locally-detected errors.
-        // ... but
-        // to check the connection before send is sense-less because
-        // after checking the communication can fail (so we would need
-        // to have 1 atomic operation to check...)
-        perror("send error");
-        break;
+      std::string command(buffer);
+
+      if (command == commandToString(SEND)) {
+        if (!handleSend(create_socket))
+          break;
+      } else if (command == commandToString(LIST)) {
+
+      } else if (command == commandToString(READ)) {
+
+      } else if (command == commandToString(DEL)) {
+
+      } else if (command == commandToString(QUIT)) {
+        sendLine(create_socket, command);
+        isQuit = 1;
+      } else {
+        std::cerr << "Unknown command\n";
       }
 
       //////////////////////////////////////////////////////////////////////
@@ -169,4 +205,80 @@ int main(int argc, char** argv) {
   }
 
   return EXIT_SUCCESS;
+}
+
+bool sendLine(int sock, const std::string& text) {
+  std::string data = text + "\n";
+  size_t sent = 0;
+  while (sent < data.size()) {
+    ssize_t n = send(sock, data.c_str() + sent, data.size() - sent, 0);
+    if (n == -1) {
+      perror("send error");
+      return false;
+    }
+    sent += n;
+  }
+  return true;
+}
+
+bool isValidUsername(const std::string& name) {
+  if ((name.size() < 1 && name.size() > 8) || name.empty())
+    return false;
+  for (char c : name) {
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+      return false;
+  }
+  return true;
+}
+
+bool askUsername(const std::string& prompt, std::string& out) {
+  while (true) {
+    std::cout << prompt << std::flush;
+    if (!std::getline(std::cin, out))
+      return false;
+    if (isValidUsername(out))
+      return true;
+    std::cerr << "Invalid name: 1-8 characters, only a-z and 0-9.\n";
+  }
+}
+
+bool askSubject(std::string& out) {
+  while (true) {
+    std::cout << "Subject: " << std::flush;
+    if (!std::getline(std::cin, out))
+      return false;
+    if (!out.empty() && out.size() <= 80)
+      return true;
+    std::cerr << "Invalid subject: 1-80 characters.\n";
+  }
+}
+
+bool handleSend(int sock) {
+  std::string sender, receiver, subject, bodyLine;
+
+  if (!askUsername("Sender: ", sender) || !sendLine(sock, sender))
+    return false;
+  if (!askUsername("Receiver: ", receiver) || !sendLine(sock, receiver))
+    return false;
+  if (!askSubject(subject) || !sendLine(sock, subject))
+    return false;
+
+  std::cout << "Message (end with a single '.' on its own line):\n";
+  do {
+    if (!std::getline(std::cin, bodyLine))
+      return false;
+    if (!sendLine(sock, bodyLine))
+      return false;
+  } while (bodyLine != ".");
+
+  // the server answers OK or ERR once the message is complete
+  char reply[BUF];
+  ssize_t size = recv(sock, reply, BUF - 1, 0);
+  if (size <= 0) {
+    std::cerr << "Server closed the connection or recv failed\n";
+    return false;
+  }
+  reply[size] = '\0';
+  std::cout << "<< " << reply;
+  return true;
 }

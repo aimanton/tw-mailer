@@ -1,2 +1,3 @@
-/twmailer-server
-/twmailer-client
+spool/
+twmailer-server
+twmailer-client

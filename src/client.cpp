@@ -9,26 +9,20 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-///////////////////////////////////////////////////////////////////////////////
-/// HELPERS
+// HELPERS
 bool sendLine(int sock, const std::string& text);
 bool isValidUsername(const std::string& name);
 bool askUsername(const std::string& prompt, std::string& out);
 bool askSubject(std::string& out);
 
-///////////////////////////////////////////////////////////////////////////////
-/// HANDLERS
+// HANDLERS
 bool handleSend(int sock);
 // TODO:
 // - handleList
 // - handleSend
 // - handleDel
 
-///////////////////////////////////////////////////////////////////////////////
-
 constexpr int BUF = 1024;
-
-///////////////////////////////////////////////////////////////////////////////
 
 enum Commands { SEND, LIST, READ, DEL, QUIT };
 
@@ -49,8 +43,6 @@ std::string commandToString(Commands command) {
   return "";
 }
 
-///////////////////////////////////////////////////////////////////////////////
-
 int main(int argc, char** argv) {
   int create_socket;
   char buffer[BUF];
@@ -58,7 +50,6 @@ int main(int argc, char** argv) {
   int size;
   int isQuit = 0;
 
-  ////////////////////////////////////////////////////////////////////////////
   // COMMAND LINE ARGUMENTS
   // ./twmailer-client <ip> <port>
   if (argc != 3) {
@@ -77,7 +68,6 @@ int main(int argc, char** argv) {
   }
   int port = static_cast<int>(portValue);
 
-  ////////////////////////////////////////////////////////////////////////////
   // CREATE A SOCKET
   // https://man7.org/linux/man-pages/man2/socket.2.html
   // https://man7.org/linux/man-pages/man7/ip.7.html
@@ -88,7 +78,6 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  ////////////////////////////////////////////////////////////////////////////
   // INIT ADDRESS
   // Attention: network byte order => big endian
   memset(&address, 0, sizeof(address)); // init storage with 0
@@ -103,7 +92,6 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  ////////////////////////////////////////////////////////////////////////////
   // CREATE A CONNECTION
   // https://man7.org/linux/man-pages/man2/connect.2.html
   if (connect(create_socket, reinterpret_cast<sockaddr*>(&address),
@@ -117,7 +105,6 @@ int main(int argc, char** argv) {
   printf("Connection with server (%s) established\n",
          inet_ntoa(address.sin_addr));
 
-  ////////////////////////////////////////////////////////////////////////////
   // RECEIVE DATA
   // https://man7.org/linux/man-pages/man2/recv.2.html
   size = recv(create_socket, buffer, BUF - 1, 0);
@@ -159,34 +146,6 @@ int main(int argc, char** argv) {
         isQuit = 1;
       } else {
         std::cerr << "Unknown command\n";
-      }
-
-      //////////////////////////////////////////////////////////////////////
-      // RECEIVE FEEDBACK
-      // consider: reconnect handling might be appropriate in somes cases
-      //           How can we determine that the command sent was received
-      //           or not?
-      //           - Resend, might change state too often.
-      //           - Else a command might have been lost.
-      //
-      // solution 1: adding meta-data (unique command id) and check on the
-      //             server if already processed.
-      // solution 2: add an infrastructure component for messaging (broker)
-      //
-      size = recv(create_socket, buffer, BUF - 1, 0);
-      if (size == -1) {
-        perror("recv error");
-        break;
-      } else if (size == 0) {
-        printf("Server closed remote socket\n"); // ignore error
-        break;
-      } else {
-        buffer[size] = '\0';
-        printf("<< %s\n", buffer); // ignore error
-        if (strcmp("OK", buffer) != 0) {
-          fprintf(stderr, "<< Server error occured, abort\n");
-          break;
-        }
       }
     }
   } while (!isQuit);
@@ -256,6 +215,8 @@ bool askSubject(std::string& out) {
 bool handleSend(int sock) {
   std::string sender, receiver, subject, bodyLine;
 
+  if (!sendLine(sock, commandToString(SEND)))
+    return false;
   if (!askUsername("Sender: ", sender) || !sendLine(sock, sender))
     return false;
   if (!askUsername("Receiver: ", receiver) || !sendLine(sock, receiver))

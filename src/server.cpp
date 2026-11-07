@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cerrno>
 #include <csignal>
@@ -5,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
@@ -12,6 +14,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <vector>
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -46,6 +49,7 @@ ReadResult readLine(int sock, std::string& pending, std::string& line);
 /// VALIDATION
 bool isValidUsername(const std::string& name);
 bool isValidSubject(const std::string& subject);
+bool isValidMessageNumber(const std::string& text, int& valueOut);
 
 /// STORAGE
 bool ensureDir(const std::string& path);
@@ -57,12 +61,16 @@ bool writeUnique(const std::string& dir, const std::string& name,
                  const std::string& content, std::string& pathOut);
 bool storeMessage(const std::string& sender, const std::string& receiver,
                   const std::string& subject, const std::string& body);
+std::string sortKey(const std::string& fileName);
+bool listMessages(const std::string& user, const std::string& box,
+                  std::vector<std::string>& files);
+bool readFile(const std::string& path, std::string& content);
 
 /// COMMAND HANDLERS
 bool handleSend(int sock, std::string& pending);
+bool handleRead(int sock, std::string& pending);
 // TODO:
 // - handleList
-// - handleRead
 // - handleDel
 
 void* clientCommunication(void* data);
@@ -287,6 +295,21 @@ bool isValidSubject(const std::string& subject) {
   return !subject.empty() && subject.size() <= MAX_SUBJECT;
 }
 
+// Message number: only digits, 1-9 characters, value at least 1.
+// (9 digits always fit into an int)
+bool isValidMessageNumber(const std::string& text, int& valueOut) {
+  if (text.empty() || text.size() > 9) {
+    return false;
+  }
+  for (char c : text) {
+    if (c < '0' || c > '9') {
+      return false;
+    }
+  }
+  valueOut = std::stoi(text);
+  return valueOut >= 1;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 /// STORAGE
 ///
@@ -413,6 +436,85 @@ bool storeMessage(const std::string& sender, const std::string& receiver,
   return true;
 }
 
+// Sort key of a file name "<subject>-<YYYYMMDD-HHMMSS-mmm>[-n].txt":
+// the part after the first '-' (the subject has no '-', see
+// sanitizeForFilename), without ".txt". So messages are ordered by arrival
+// time. Without ".txt" the "-1" copy sorts after the original name.
+std::string sortKey(const std::string& fileName) {
+  std::string name = fileName;
+  if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".txt") == 0) {
+    name.erase(name.size() - 4);
+  }
+  size_t dash = name.find('-');
+  return dash == std::string::npos ? name : name.substr(dash + 1);
+}
+
+// Fills 'files' with the names of all messages in <spool>/<user>/<box>,
+// oldest first. The position in this list (starting at 1) is the message
+// number, so LIST, READ and DEL must all use this function.
+// A folder that does not exist is no error: the user simply has no messages.
+// Returns false only on a real error. The user name must be validated BEFORE.
+bool listMessages(const std::string& user, const std::string& box,
+                  std::vector<std::string>& files) {
+  namespace fs = std::filesystem;
+  files.clear();
+
+  std::string dir = spoolDirectory + "/" + user + "/" + box;
+  std::error_code ec;
+  fs::directory_iterator it(dir, ec);
+  if (ec) {
+    if (ec == std::errc::no_such_file_or_directory) {
+      return true;
+    }
+    fprintf(stderr, "Cannot open directory '%s': %s\n", dir.c_str(),
+            ec.message().c_str());
+    return false;
+  }
+
+  fs::directory_iterator end;
+  while (it != end) {
+    if (it->is_regular_file(ec) && it->path().extension() == ".txt") {
+      files.push_back(it->path().filename().string());
+    }
+    it.increment(ec);
+    if (ec) {
+      fprintf(stderr, "Cannot read directory '%s': %s\n", dir.c_str(),
+              ec.message().c_str());
+      return false;
+    }
+  }
+
+  std::sort(files.begin(), files.end(),
+            [](const std::string& a, const std::string& b) {
+              std::string keyA = sortKey(a);
+              std::string keyB = sortKey(b);
+              return keyA != keyB ? keyA < keyB : a < b;
+            });
+  return true;
+}
+
+// Reads a whole file into 'content'.
+bool readFile(const std::string& path, std::string& content) {
+  FILE* file = fopen(path.c_str(), "rb");
+  if (file == nullptr) {
+    fprintf(stderr, "Cannot open '%s': %s\n", path.c_str(), strerror(errno));
+    return false;
+  }
+
+  content.clear();
+  char chunk[BUF];
+  size_t n;
+  while ((n = fread(chunk, 1, sizeof(chunk), file)) > 0) {
+    content.append(chunk, n);
+  }
+  bool ok = ferror(file) == 0;
+  fclose(file);
+  if (!ok) {
+    fprintf(stderr, "Cannot read '%s'\n", path.c_str());
+  }
+  return ok;
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 /// COMMAND HANDLERS
 
@@ -448,6 +550,41 @@ bool handleSend(int sock, std::string& pending) {
   return sendLine(sock, ok ? "OK" : "ERR");
 }
 
+// READ\n<username>\n<message number>\n
+// Answer: OK\n<sender>\n<receiver>\n<subject>\n<body lines>\n.\n  or  ERR\n
+// Returns false if the connection is gone (then there is nobody to answer).
+bool handleRead(int sock, std::string& pending) {
+  std::string username, numberText, content;
+
+  // ALWAYS read both lines, even if the first one turns out to be invalid.
+  // Otherwise the second line would be interpreted as a command.
+  if (readLine(sock, pending, username) != LINE_OK ||
+      readLine(sock, pending, numberText) != LINE_OK) {
+    return false;
+  }
+
+  int number = 0;
+  std::vector<std::string> files;
+  bool ok = isValidUsername(username) &&
+            isValidMessageNumber(numberText, number) &&
+            listMessages(username, "received", files) &&
+            static_cast<size_t>(number) <= files.size() &&
+            readFile(spoolDirectory + "/" + username + "/received/" +
+                         files[number - 1],
+                     content);
+  if (!ok) {
+    fprintf(stderr, "READ rejected (invalid input or no such message)\n");
+    return sendLine(sock, "ERR");
+  }
+
+  // every stored line ends with '\n'; make sure the final '.' is on its own
+  // line
+  if (!content.empty() && content.back() != '\n') {
+    content += "\n";
+  }
+  return sendAll(sock, "OK\n" + content + ".\n");
+}
+
 void* clientCommunication(void* data) {
   char buffer[BUF];
   int* current_socket = static_cast<int*>(data);
@@ -481,10 +618,14 @@ void* clientCommunication(void* data) {
       if (!handleSend(*current_socket, pending)) {
         break;
       }
+    } else if (line == "READ") {
+      if (!handleRead(*current_socket, pending)) {
+        break;
+      }
     } else if (line == "QUIT") {
       break; // the server does not respond to QUIT
     } else {
-      // TODO: LIST, READ, DEL
+      // TODO: LIST, DEL
       if (!sendLine(*current_socket, "ERR")) {
         break;
       }

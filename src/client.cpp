@@ -15,6 +15,13 @@ bool isValidUsername(const std::string& name);
 bool askUsername(const std::string& prompt, std::string& out);
 bool askSubject(std::string& out);
 
+enum ReadResult { LINE_OK, LINE_CLOSED, LINE_ERROR };
+constexpr size_t MAX_LINE = 8192;
+
+ReadResult readLine(int sock, std::string& pending, std::string& line);
+bool isValidMessageNumber(const std::string& number);
+bool askMessageNumber(std::string& out);
+bool handleRead(int sock, std::string& pending);
 // HANDLERS
 bool handleSend(int sock);
 // TODO:
@@ -117,6 +124,7 @@ int main(int argc, char** argv) {
     printf("%s", buffer); // ignore error
   }
 
+  std::string pending;
   do {
     printf(">> ");
     if (fgets(buffer, BUF - 1, stdin) != nullptr) {
@@ -138,6 +146,8 @@ int main(int argc, char** argv) {
       } else if (command == commandToString(LIST)) {
 
       } else if (command == commandToString(READ)) {
+        if (!handleRead(create_socket, pending))
+          break;
 
       } else if (command == commandToString(DEL)) {
 
@@ -241,5 +251,96 @@ bool handleSend(int sock) {
   }
   reply[size] = '\0';
   std::cout << "<< " << reply;
+  return true;
+}
+
+// Returns exactly one line (without '\n' / '\r'). 'pending' keeps bytes that
+// were received but not handed out yet; it lives as long as the connection.
+ReadResult readLine(int sock, std::string& pending, std::string& line) {
+  while (true) {
+    size_t pos = pending.find('\n');
+    if (pos != std::string::npos) {
+      line = pending.substr(0, pos);
+      pending.erase(0, pos + 1);
+      if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      return LINE_OK;
+    }
+    if (pending.size() > MAX_LINE) {
+      std::cerr << "Server sent a line that is too long\n";
+      return LINE_ERROR;
+    }
+    char chunk[BUF];
+    ssize_t n = recv(sock, chunk, sizeof(chunk), 0);
+    if (n == -1) {
+      perror("recv error");
+      return LINE_ERROR;
+    }
+    if (n == 0) {
+      return LINE_CLOSED;
+    }
+    pending.append(chunk, n);
+  }
+}
+
+// only digits, 1-9 characters, value at least 1
+bool isValidMessageNumber(const std::string& number) {
+  if (number.empty() || number.size() > 9) {
+    return false;
+  }
+  for (char c : number) {
+    if (c < '0' || c > '9') {
+      return false;
+    }
+  }
+  return std::stoi(number) >= 1;
+}
+
+bool askMessageNumber(std::string& out) {
+  while (true) {
+    std::cout << "Message-Number: " << std::flush;
+    if (!std::getline(std::cin, out)) {
+      return false;
+    }
+    if (isValidMessageNumber(out)) {
+      return true;
+    }
+    std::cerr << "Invalid number: 1-9 digits, at least 1.\n";
+  }
+}
+
+bool handleRead(int sock, std::string& pending) {
+  std::string username, messageNumber, line;
+
+  if (!sendLine(sock, commandToString(READ)))
+    return false;
+  if (!askUsername("Username: ", username) || !sendLine(sock, username))
+    return false;
+  if (!askMessageNumber(messageNumber) || !sendLine(sock, messageNumber))
+    return false;
+
+  // first line of the answer: OK or ERR
+  if (readLine(sock, pending, line) != LINE_OK) {
+    std::cerr << "Server closed the connection or recv failed\n";
+    return false;
+  }
+  if (line != "OK") {
+    std::cout << "<< " << line << "\n"; // ERR: the session goes on
+    return true;
+  }
+
+  // message: sender, receiver, subject, body lines, then a line with '.'
+  std::cout << "<< OK\n";
+  while (true) {
+    if (readLine(sock, pending, line) != LINE_OK) {
+      std::cerr << "Connection lost while reading the message\n";
+      return false;
+    }
+    if (line == ".") {
+      break;
+    }
+    std::cout << line << "\n";
+  }
   return true;
 }

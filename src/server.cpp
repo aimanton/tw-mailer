@@ -65,12 +65,13 @@ std::string sortKey(const std::string& fileName);
 bool listMessages(const std::string& user, const std::string& box,
                   std::vector<std::string>& files);
 bool readFile(const std::string& path, std::string& content);
+std::string readSubject(const std::string& path);
 
 /// COMMAND HANDLERS
 bool handleSend(int sock, std::string& pending);
 bool handleRead(int sock, std::string& pending);
+bool handleList(int sock, std::string& pending);
 // TODO:
-// - handleList
 // - handleDel
 
 void* clientCommunication(void* data);
@@ -515,6 +516,29 @@ bool readFile(const std::string& path, std::string& content) {
   return ok;
 }
 
+// Returns the subject of a stored message (3rd line of the file). A damaged
+// message still gets a line in LIST, otherwise the numbers would not match
+// the ones READ and DEL use.
+std::string readSubject(const std::string& path) {
+  const std::string unreadable = "(unreadable message)";
+  std::string content;
+  if (!readFile(path, content)) {
+    return unreadable;
+  }
+
+  size_t afterSender = content.find('\n');
+  if (afterSender == std::string::npos) {
+    return unreadable;
+  }
+  size_t afterReceiver = content.find('\n', afterSender + 1);
+  if (afterReceiver == std::string::npos) {
+    return unreadable;
+  }
+  size_t start = afterReceiver + 1;
+  size_t end = content.find('\n', start);
+  return content.substr(start, end == std::string::npos ? end : end - start);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 /// COMMAND HANDLERS
 
@@ -585,6 +609,32 @@ bool handleRead(int sock, std::string& pending) {
   return sendAll(sock, "OK\n" + content + ".\n");
 }
 
+// LIST\n<username>\n
+// Answer: <count>\n<subject 1>\n...<subject count>\n
+// Count is 0 for an unknown user, an invalid name or a storage error.
+// Returns false if the connection is gone (then there is nobody to answer).
+bool handleList(int sock, std::string& pending) {
+  std::string username;
+  if (readLine(sock, pending, username) != LINE_OK) {
+    return false;
+  }
+
+  std::vector<std::string> files;
+  if (!isValidUsername(username) ||
+      !listMessages(username, "received", files)) {
+    fprintf(stderr, "LIST rejected (invalid input or storage error)\n");
+    return sendLine(sock, "0");
+  }
+
+  std::string answer = std::to_string(files.size()) + "\n";
+  for (const std::string& file : files) {
+    answer +=
+        readSubject(spoolDirectory + "/" + username + "/received/" + file) +
+        "\n";
+  }
+  return sendAll(sock, answer);
+}
+
 void* clientCommunication(void* data) {
   char buffer[BUF];
   int* current_socket = static_cast<int*>(data);
@@ -622,10 +672,14 @@ void* clientCommunication(void* data) {
       if (!handleRead(*current_socket, pending)) {
         break;
       }
+    } else if (line == "LIST") {
+      if (!handleList(*current_socket, pending)) {
+        break;
+      }
     } else if (line == "QUIT") {
       break; // the server does not respond to QUIT
     } else {
-      // TODO: LIST, DEL
+      // TODO: DEL
       if (!sendLine(*current_socket, "ERR")) {
         break;
       }

@@ -1,3 +1,4 @@
 spool/
 twmailer-server
 twmailer-client
+.idea/*

@@ -24,8 +24,8 @@ bool askMessageNumber(std::string& out);
 bool handleRead(int sock, std::string& pending);
 // HANDLERS
 bool handleSend(int sock);
+bool handleList(int sock, std::string& pending);
 // TODO:
-// - handleList
 // - handleSend
 // - handleDel
 
@@ -144,7 +144,8 @@ int main(int argc, char** argv) {
         if (!handleSend(create_socket))
           break;
       } else if (command == commandToString(LIST)) {
-
+        if (!handleList(create_socket, pending))
+          break;
       } else if (command == commandToString(READ)) {
         if (!handleRead(create_socket, pending))
           break;
@@ -341,6 +342,37 @@ bool handleRead(int sock, std::string& pending) {
       break;
     }
     std::cout << line << "\n";
+  }
+  return true;
+}
+
+bool handleList(int sock, std::string& pending) {
+  std::string username, line;
+
+  if (!sendLine(sock, commandToString(LIST)))
+    return false;
+  if (!askUsername("Username: ", username) || !sendLine(sock, username))
+    return false;
+
+  // first line of the answer: number of subjects that follow
+  if (readLine(sock, pending, line) != LINE_OK) {
+    std::cerr << "Server closed the connection or recv failed\n";
+    return false;
+  }
+  if (line != "0" && !isValidMessageNumber(line)) {
+    std::cout << "<< " << line << "\n"; // no count: nothing else will follow
+    return true;
+  }
+
+  int count = std::stoi(line);
+  std::cout << "<< " << count << " message(s)\n";
+  for (int i = 1; i <= count; ++i) {
+    if (readLine(sock, pending, line) != LINE_OK) {
+      std::cerr << "Connection lost while reading the list\n";
+      return false;
+    }
+    // same number that READ expects
+    std::cout << i << ": " << line << "\n";
   }
   return true;
 }

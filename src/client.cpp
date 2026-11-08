@@ -25,9 +25,7 @@ bool handleRead(int sock, std::string& pending);
 // HANDLERS
 bool handleSend(int sock);
 bool handleList(int sock, std::string& pending);
-// TODO:
-// - handleSend
-// - handleDel
+bool handleDel(int sock, std::string& pending);
 
 constexpr int BUF = 1024;
 
@@ -151,7 +149,8 @@ int main(int argc, char** argv) {
           break;
 
       } else if (command == commandToString(DEL)) {
-
+        if (!handleDel(create_socket, pending))
+          break;
       } else if (command == commandToString(QUIT)) {
         sendLine(create_socket, command);
         isQuit = 1;
@@ -374,5 +373,23 @@ bool handleList(int sock, std::string& pending) {
     // same number that READ expects
     std::cout << i << ": " << line << "\n";
   }
+  return true;
+}
+
+bool handleDel(int sock, std::string& pending) {
+  std::string username, messageNumber, line;
+
+  if (!sendLine(sock, commandToString(DEL)))
+    return false;
+  if (!askUsername("Username: ", username) || !sendLine(sock, username))
+    return false;
+  if (!askMessageNumber(messageNumber) || !sendLine(sock, messageNumber))
+    return false;
+
+  if (readLine(sock, pending, line) != LINE_OK) {
+    std::cerr << "Server closed the connection or recv failed\n";
+    return false;
+  }
+  std::cout << "<< " << line << "\n"; // OK or ERR: the session goes on
   return true;
 }

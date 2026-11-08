@@ -71,8 +71,7 @@ std::string readSubject(const std::string& path);
 bool handleSend(int sock, std::string& pending);
 bool handleRead(int sock, std::string& pending);
 bool handleList(int sock, std::string& pending);
-// TODO:
-// - handleDel
+bool handleDel(int sock, std::string& pending);
 
 void* clientCommunication(void* data);
 void signalHandler(int sig);
@@ -635,6 +634,35 @@ bool handleList(int sock, std::string& pending) {
   return sendAll(sock, answer);
 }
 
+// DEL\n<username>\n<message number>\n
+// Answer: OK\n  or  ERR\n
+// Deletes from the inbox only, the copy in the sender's sent folder stays.
+// Returns false if the connection is gone (then there is nobody to answer).
+bool handleDel(int sock, std::string& pending) {
+  std::string username, numberText;
+
+  // ALWAYS read both lines, even if the first one turns out to be invalid.
+  // Otherwise the second line would be interpreted as a command.
+  if (readLine(sock, pending, username) != LINE_OK ||
+      readLine(sock, pending, numberText) != LINE_OK) {
+    return false;
+  }
+
+  int number = 0;
+  std::vector<std::string> files;
+  bool ok = isValidUsername(username) &&
+            isValidMessageNumber(numberText, number) &&
+            listMessages(username, "received", files) &&
+            static_cast<size_t>(number) <= files.size() &&
+            remove((spoolDirectory + "/" + username + "/received/" +
+                    files[number - 1])
+                       .c_str()) == 0;
+  if (!ok) {
+    fprintf(stderr, "DEL rejected (invalid input or no such message)\n");
+  }
+  return sendLine(sock, ok ? "OK" : "ERR");
+}
+
 void* clientCommunication(void* data) {
   char buffer[BUF];
   int* current_socket = static_cast<int*>(data);
@@ -676,10 +704,14 @@ void* clientCommunication(void* data) {
       if (!handleList(*current_socket, pending)) {
         break;
       }
+    } else if (line == "DEL") {
+      if (!handleDel(*current_socket, pending)) {
+        break;
+      }
     } else if (line == "QUIT") {
       break; // the server does not respond to QUIT
     } else {
-      // TODO: DEL
+      // unknown command
       if (!sendLine(*current_socket, "ERR")) {
         break;
       }

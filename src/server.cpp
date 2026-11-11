@@ -68,6 +68,7 @@ bool readFile(const std::string& path, std::string& content);
 std::string readSubject(const std::string& path);
 
 /// COMMAND HANDLERS
+bool sendError(int sock, const char* command, const std::string& reason);
 bool handleSend(int sock, std::string& pending);
 bool handleRead(int sock, std::string& pending);
 bool handleList(int sock, std::string& pending);
@@ -541,6 +542,13 @@ std::string readSubject(const std::string& path) {
 ///////////////////////////////////////////////////////////////////////////////
 /// COMMAND HANDLERS
 
+// Logs the reason and answers "ERR <reason>" on a single line, so the client
+// knows what went wrong. Returns false if the connection is gone.
+bool sendError(int sock, const char* command, const std::string& reason) {
+  fprintf(stderr, "%s rejected: %s\n", command, reason.c_str());
+  return sendLine(sock, "ERR " + reason);
+}
+
 // SEND\n<sender>\n<receiver>\n<subject>\n<body lines>\n.\n
 // Returns false if the connection is gone (then there is nobody to answer).
 bool handleSend(int sock, std::string& pending) {
@@ -564,17 +572,23 @@ bool handleSend(int sock, std::string& pending) {
     body += line + "\n";
   }
 
-  bool ok = isValidUsername(sender) && isValidUsername(receiver) &&
-            isValidSubject(subject) &&
-            storeMessage(sender, receiver, subject, body);
-  if (!ok) {
-    fprintf(stderr, "SEND rejected (invalid input or storage error)\n");
+  if (!isValidUsername(sender)) {
+    return sendError(sock, "SEND", "invalid sender username");
   }
-  return sendLine(sock, ok ? "OK" : "ERR");
+  if (!isValidUsername(receiver)) {
+    return sendError(sock, "SEND", "invalid receiver username");
+  }
+  if (!isValidSubject(subject)) {
+    return sendError(sock, "SEND", "invalid subject (1-80 characters)");
+  }
+  if (!storeMessage(sender, receiver, subject, body)) {
+    return sendError(sock, "SEND", "could not store message");
+  }
+  return sendLine(sock, "OK");
 }
 
 // READ\n<username>\n<message number>\n
-// Answer: OK\n<sender>\n<receiver>\n<subject>\n<body lines>\n.\n  or  ERR\n
+// Answer: OK\n<sender>\n<receiver>\n<subject>\n<body lines>\n.\n  or  ERR <reason>\n
 // Returns false if the connection is gone (then there is nobody to answer).
 bool handleRead(int sock, std::string& pending) {
   std::string username, numberText, content;
@@ -588,16 +602,22 @@ bool handleRead(int sock, std::string& pending) {
 
   int number = 0;
   std::vector<std::string> files;
-  bool ok = isValidUsername(username) &&
-            isValidMessageNumber(numberText, number) &&
-            listMessages(username, "received", files) &&
-            static_cast<size_t>(number) <= files.size() &&
-            readFile(spoolDirectory + "/" + username + "/received/" +
-                         files[number - 1],
-                     content);
-  if (!ok) {
-    fprintf(stderr, "READ rejected (invalid input or no such message)\n");
-    return sendLine(sock, "ERR");
+  if (!isValidUsername(username)) {
+    return sendError(sock, "READ", "invalid username");
+  }
+  if (!isValidMessageNumber(numberText, number)) {
+    return sendError(sock, "READ", "invalid message number");
+  }
+  if (!listMessages(username, "received", files)) {
+    return sendError(sock, "READ", "could not read mailbox");
+  }
+  if (static_cast<size_t>(number) > files.size()) {
+    return sendError(sock, "READ", "no such message");
+  }
+  if (!readFile(spoolDirectory + "/" + username + "/received/" +
+                    files[number - 1],
+                content)) {
+    return sendError(sock, "READ", "could not read message");
   }
 
   // every stored line ends with '\n'; make sure the final '.' is on its own
@@ -619,10 +639,11 @@ bool handleList(int sock, std::string& pending) {
   }
 
   std::vector<std::string> files;
-  if (!isValidUsername(username) ||
-      !listMessages(username, "received", files)) {
-    fprintf(stderr, "LIST rejected (invalid input or storage error)\n");
-    return sendLine(sock, "0");
+  if (!isValidUsername(username)) {
+    return sendError(sock, "LIST", "invalid username");
+  }
+  if (!listMessages(username, "received", files)) {
+    return sendError(sock, "LIST", "could not read mailbox");
   }
 
   std::string answer = std::to_string(files.size()) + "\n";
@@ -650,17 +671,25 @@ bool handleDel(int sock, std::string& pending) {
 
   int number = 0;
   std::vector<std::string> files;
-  bool ok = isValidUsername(username) &&
-            isValidMessageNumber(numberText, number) &&
-            listMessages(username, "received", files) &&
-            static_cast<size_t>(number) <= files.size() &&
-            remove((spoolDirectory + "/" + username + "/received/" +
-                    files[number - 1])
-                       .c_str()) == 0;
-  if (!ok) {
-    fprintf(stderr, "DEL rejected (invalid input or no such message)\n");
+  if (!isValidUsername(username)) {
+    return sendError(sock, "DEL", "invalid username");
   }
-  return sendLine(sock, ok ? "OK" : "ERR");
+  if (!isValidMessageNumber(numberText, number)) {
+    return sendError(sock, "DEL", "invalid message number");
+  }
+  if (!listMessages(username, "received", files)) {
+    return sendError(sock, "DEL", "could not read mailbox");
+  }
+  if (static_cast<size_t>(number) > files.size()) {
+    return sendError(sock, "DEL", "no such message");
+  }
+  std::string path =
+      spoolDirectory + "/" + username + "/received/" + files[number - 1];
+  if (remove(path.c_str()) != 0) {
+    fprintf(stderr, "Cannot delete '%s': %s\n", path.c_str(), strerror(errno));
+    return sendError(sock, "DEL", "could not delete message");
+  }
+  return sendLine(sock, "OK");
 }
 
 void* clientCommunication(void* data) {

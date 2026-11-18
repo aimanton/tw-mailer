@@ -419,21 +419,17 @@ bool storeMessage(const std::string& sender, const std::string& receiver,
   std::string content = sender + "\n" + receiver + "\n" + subject + "\n" + body;
   std::string name = sanitizeForFilename(subject) + "-" + timestamp();
 
-  std::string receivedDir, sentDir;
-  if (!ensureMailbox(receiver, "received", receivedDir) ||
-      !ensureMailbox(sender, "sent", sentDir)) {
+  std::string receivedDir;
+  if (!ensureMailbox(receiver, "received", receivedDir)) {
     return false;
   }
 
-  std::string receivedPath, sentPath;
+  std::string receivedPath;
   if (!writeUnique(receivedDir, name, content, receivedPath)) {
     return false;
   }
-  if (!writeUnique(sentDir, name, content, sentPath)) {
-    remove(receivedPath.c_str());
-    return false;
-  }
-  printf("Stored message: %s and %s\n", receivedPath.c_str(), sentPath.c_str());
+
+  printf("Stored message: %s.", receivedPath.c_str());
   return true;
 }
 

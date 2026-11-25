@@ -5,14 +5,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <filesystem>
+#include <mutex>
+#include <shared_mutex>
 #include <netinet/in.h>
 #include <string>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/time.h>
 #include <sys/types.h>
+#include <system_error>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -36,9 +38,20 @@ int new_socket = -1;
 // base folder for the mail storage (2nd command line argument)
 std::string spoolDirectory;
 
+// protects the mail spool:
+//   SEND, DEL  -> exclusive lock (std::unique_lock): only this one thread
+//   LIST, READ -> shared lock (std::shared_lock): many readers at once,
+//                 but never while a SEND or DEL is running
+// Only file work happens under the lock, never sending to the client: a slow
+// client must not block all other threads.
+std::shared_mutex mailboxMutex;
+
 ///////////////////////////////////////////////////////////////////////////////
 
 enum ReadResult { LINE_OK, LINE_CLOSED, LINE_ERROR };
+
+// all commands of the protocol; UNKNOWN = the line is none of them
+enum class Command { SEND, READ, LIST, DEL, QUIT, UNKNOWN };
 
 ///////////////////////////////////////////////////////////////////////////////
 /// SOCKET HELPERS
@@ -56,12 +69,12 @@ bool ensureDir(const std::string& path);
 bool ensureMailbox(const std::string& user, const std::string& box,
                    std::string& dirOut);
 std::string sanitizeForFilename(const std::string& text);
-std::string timestamp();
-bool writeUnique(const std::string& dir, const std::string& name,
-                 const std::string& content, std::string& pathOut);
+unsigned long messageId(const std::string& fileName);
+unsigned long nextMessageId(const std::string& dir);
+bool writeNewMessage(const std::string& dir, const std::string& subjectPart,
+                     const std::string& content, std::string& pathOut);
 bool storeMessage(const std::string& sender, const std::string& receiver,
                   const std::string& subject, const std::string& body);
-std::string sortKey(const std::string& fileName);
 bool listMessages(const std::string& user, const std::string& box,
                   std::vector<std::string>& files);
 bool readFile(const std::string& path, std::string& content);
@@ -73,8 +86,10 @@ bool handleSend(int sock, std::string& pending);
 bool handleRead(int sock, std::string& pending);
 bool handleList(int sock, std::string& pending);
 bool handleDel(int sock, std::string& pending);
+Command parseCommand(const std::string& line);
+bool handleCommand(int sock, const std::string& line, std::string& pending);
 
-void* clientCommunication(void* data);
+void clientCommunication(int sock);
 void signalHandler(int sig);
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -178,9 +193,12 @@ int main(int argc, char* argv[]) {
     // ACCEPTS CONNECTION SETUP
     // blocking, might have an accept-error on ctrl+c
     addrlen = sizeof(sockaddr_in);
-    if ((new_socket =
-             accept(create_socket, reinterpret_cast<sockaddr*>(&cliaddress),
-                    &addrlen)) == -1) {
+    // local variable: every client gets its own socket, the next accept() must
+    // not overwrite the one a running thread is still using
+    int clientSocket =
+        accept(create_socket, reinterpret_cast<sockaddr*>(&cliaddress),
+               &addrlen);
+    if (clientSocket == -1) {
       if (abortRequested) {
         perror("accept error after aborted");
       } else {
@@ -192,10 +210,21 @@ int main(int argc, char* argv[]) {
     /////////////////////////////////////////////////////////////////////////
     // START CLIENT
     // ignore printf error handling
-    printf("Client connected from %s:%d...\n", inet_ntoa(cliaddress.sin_addr),
+    // inet_ntop instead of inet_ntoa: inet_ntoa returns a static buffer and is
+    // therefore not thread safe
+    char clientIp[INET_ADDRSTRLEN] = "?";
+    inet_ntop(AF_INET, &cliaddress.sin_addr, clientIp, sizeof(clientIp));
+    printf("Client connected from %s:%d...\n", clientIp,
            ntohs(cliaddress.sin_port));
-    clientCommunication(&new_socket); // returnValue can be ignored
-    new_socket = -1;
+
+    // one thread per client; the socket is passed BY VALUE.
+    // detach: the thread cleans up by itself when the client is done.
+    try {
+      std::thread(clientCommunication, clientSocket).detach();
+    } catch (const std::system_error& e) {
+      fprintf(stderr, "Cannot create thread: %s\n", e.what());
+      close(clientSocket);
+    }
   }
 
   // frees the descriptor
@@ -315,8 +344,11 @@ bool isValidMessageNumber(const std::string& text, int& valueOut) {
 /// STORAGE
 ///
 /// Layout:
-///   <spool>/<user>/sent/<subject>-<timestamp>.txt
-///   <spool>/<user>/received/<subject>-<timestamp>.txt
+///   <spool>/<user>/received/<subject>-<id>.txt
+///
+/// <id> is a running number per mailbox (1, 2, 3, ...). The next message gets
+/// the highest existing id + 1, so it also continues correctly after a
+/// server restart.
 ///
 /// File content (the message as defined in the protocol):
 ///   <sender>\n
@@ -360,31 +392,53 @@ std::string sanitizeForFilename(const std::string& text) {
   return result;
 }
 
-// Local time as YYYYMMDD-HHMMSS-mmm (milliseconds keep names unique)
-std::string timestamp() {
-  timeval tv{};
-  gettimeofday(&tv, nullptr);
-  tm tmValue{};
-  localtime_r(&tv.tv_sec, &tmValue);
-  char date[32];
-  strftime(date, sizeof(date), "%Y%m%d-%H%M%S", &tmValue);
-  char result[48];
-  snprintf(result, sizeof(result), "%s-%03d", date,
-           static_cast<int>(tv.tv_usec / 1000));
-  return result;
+// Id of a file name "<subject>-<id>.txt" (the subject has no '-', see
+// sanitizeForFilename). Returns 0 if the name has no valid id
+// such files are sorted first and never block a new id.
+unsigned long messageId(const std::string& fileName) {
+  std::string name = fileName;
+  if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".txt") == 0) {
+    name.erase(name.size() - 4);
+  }
+  size_t dash = name.find('-');
+  if (dash == std::string::npos) {
+    return 0;
+  }
+  std::string idText = name.substr(dash + 1);
+  if (idText.empty() || idText.size() > 9) {
+    return 0;
+  }
+  for (char c : idText) {
+    if (c < '0' || c > '9') {
+      return 0;
+    }
+  }
+  return std::stoul(idText);
 }
 
-// Writes content into <dir>/<name>.txt. If that file exists already (same
-// subject in the same millisecond) it tries <name>-1.txt, <name>-2.txt, ...
-// Mode "wx" fails if the file exists, so nothing is ever overwritten.
-bool writeUnique(const std::string& dir, const std::string& name,
-                 const std::string& content, std::string& pathOut) {
-  for (int i = 0; i < 100; ++i) {
-    std::string path = dir + "/" + name;
-    if (i > 0) {
-      path += "-" + std::to_string(i);
-    }
-    path += ".txt";
+// Highest id in 'dir' + 1. Must be called while mailboxMutex is locked exclusively,
+// otherwise two threads could get the same id.
+unsigned long nextMessageId(const std::string& dir) {
+  namespace fs = std::filesystem;
+  unsigned long maxId = 0;
+  std::error_code ec;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end;
+       it.increment(ec)) {
+    maxId = std::max(maxId, messageId(it->path().filename().string()));
+  }
+  return maxId + 1;
+}
+
+// Writes content into <dir>/<subjectPart>-<id>.txt with the next free id.
+// Mode "wx" fails if the file exists, so nothing is ever overwritten; in that
+// case (a foreign file with that id) the next id is tried.
+// Must be called while mailboxMutex is locked exclusively.
+bool writeNewMessage(const std::string& dir, const std::string& subjectPart,
+                     const std::string& content, std::string& pathOut) {
+  unsigned long id = nextMessageId(dir);
+  for (int attempt = 0; attempt < 100; ++attempt, ++id) {
+    std::string path = dir + "/" + subjectPart + "-" + std::to_string(id) +
+                       ".txt";
 
     FILE* file = fopen(path.c_str(), "wx");
     if (file == nullptr) {
@@ -417,7 +471,11 @@ bool writeUnique(const std::string& dir, const std::string& name,
 bool storeMessage(const std::string& sender, const std::string& receiver,
                   const std::string& subject, const std::string& body) {
   std::string content = sender + "\n" + receiver + "\n" + subject + "\n" + body;
-  std::string name = sanitizeForFilename(subject) + "-" + timestamp();
+
+  // exclusive: creating the folders, picking the id and creating the file
+  // must not overlap with another SEND/DEL, and no LIST/READ may see a half
+  // written file. unique_lock unlocks automatically when the function returns.
+  std::unique_lock<std::shared_mutex> lock(mailboxMutex);
 
   std::string receivedDir;
   if (!ensureMailbox(receiver, "received", receivedDir)) {
@@ -425,25 +483,13 @@ bool storeMessage(const std::string& sender, const std::string& receiver,
   }
 
   std::string receivedPath;
-  if (!writeUnique(receivedDir, name, content, receivedPath)) {
+  if (!writeNewMessage(receivedDir, sanitizeForFilename(subject), content,
+                       receivedPath)) {
     return false;
   }
 
   printf("Stored message: %s.", receivedPath.c_str());
   return true;
-}
-
-// Sort key of a file name "<subject>-<YYYYMMDD-HHMMSS-mmm>[-n].txt":
-// the part after the first '-' (the subject has no '-', see
-// sanitizeForFilename), without ".txt". So messages are ordered by arrival
-// time. Without ".txt" the "-1" copy sorts after the original name.
-std::string sortKey(const std::string& fileName) {
-  std::string name = fileName;
-  if (name.size() >= 4 && name.compare(name.size() - 4, 4, ".txt") == 0) {
-    name.erase(name.size() - 4);
-  }
-  size_t dash = name.find('-');
-  return dash == std::string::npos ? name : name.substr(dash + 1);
 }
 
 // Fills 'files' with the names of all messages in <spool>/<user>/<box>,
@@ -483,9 +529,9 @@ bool listMessages(const std::string& user, const std::string& box,
 
   std::sort(files.begin(), files.end(),
             [](const std::string& a, const std::string& b) {
-              std::string keyA = sortKey(a);
-              std::string keyB = sortKey(b);
-              return keyA != keyB ? keyA < keyB : a < b;
+              unsigned long idA = messageId(a);
+              unsigned long idB = messageId(b);
+              return idA != idB ? idA < idB : a < b;
             });
   return true;
 }
@@ -604,16 +650,24 @@ bool handleRead(int sock, std::string& pending) {
   if (!isValidMessageNumber(numberText, number)) {
     return sendError(sock, "READ", "invalid message number");
   }
-  if (!listMessages(username, "received", files)) {
-    return sendError(sock, "READ", "could not read mailbox");
-  }
-  if (static_cast<size_t>(number) > files.size()) {
-    return sendError(sock, "READ", "no such message");
-  }
-  if (!readFile(spoolDirectory + "/" + username + "/received/" +
-                    files[number - 1],
-                content)) {
-    return sendError(sock, "READ", "could not read message");
+
+  // listing and reading must happen under ONE lock, otherwise a DEL in
+  // between could shift the numbers or remove the file
+  std::string error;
+  {
+    std::shared_lock<std::shared_mutex> lock(mailboxMutex);
+    if (!listMessages(username, "received", files)) {
+      error = "could not read mailbox";
+    } else if (static_cast<size_t>(number) > files.size()) {
+      error = "no such message";
+    } else if (!readFile(spoolDirectory + "/" + username + "/received/" +
+                             files[number - 1],
+                         content)) {
+      error = "could not read message";
+    }
+  } // lock released here, before answering the client
+  if (!error.empty()) {
+    return sendError(sock, "READ", error);
   }
 
   // every stored line ends with '\n'; make sure the final '.' is on its own
@@ -638,15 +692,23 @@ bool handleList(int sock, std::string& pending) {
   if (!isValidUsername(username)) {
     return sendError(sock, "LIST", "invalid username");
   }
-  if (!listMessages(username, "received", files)) {
-    return sendError(sock, "LIST", "could not read mailbox");
-  }
 
-  std::string answer = std::to_string(files.size()) + "\n";
-  for (const std::string& file : files) {
-    answer +=
-        readSubject(spoolDirectory + "/" + username + "/received/" + file) +
-        "\n";
+  bool listed;
+  std::string answer;
+  {
+    std::shared_lock<std::shared_mutex> lock(mailboxMutex);
+    listed = listMessages(username, "received", files);
+    if (listed) {
+      answer = std::to_string(files.size()) + "\n";
+      for (const std::string& file : files) {
+        answer +=
+            readSubject(spoolDirectory + "/" + username + "/received/" + file) +
+            "\n";
+      }
+    }
+  } // lock released here, before answering the client
+  if (!listed) {
+    return sendError(sock, "LIST", "could not read mailbox");
   }
   return sendAll(sock, answer);
 }
@@ -673,24 +735,65 @@ bool handleDel(int sock, std::string& pending) {
   if (!isValidMessageNumber(numberText, number)) {
     return sendError(sock, "DEL", "invalid message number");
   }
-  if (!listMessages(username, "received", files)) {
-    return sendError(sock, "DEL", "could not read mailbox");
-  }
-  if (static_cast<size_t>(number) > files.size()) {
-    return sendError(sock, "DEL", "no such message");
-  }
-  std::string path =
-      spoolDirectory + "/" + username + "/received/" + files[number - 1];
-  if (remove(path.c_str()) != 0) {
-    fprintf(stderr, "Cannot delete '%s': %s\n", path.c_str(), strerror(errno));
-    return sendError(sock, "DEL", "could not delete message");
+
+  // exclusive: listing and deleting must happen under ONE lock, otherwise
+  // another DEL in between could shift the numbers -> wrong mail deleted
+  std::string error;
+  {
+    std::unique_lock<std::shared_mutex> lock(mailboxMutex);
+    if (!listMessages(username, "received", files)) {
+      error = "could not read mailbox";
+    } else if (static_cast<size_t>(number) > files.size()) {
+      error = "no such message";
+    } else {
+      std::string path =
+          spoolDirectory + "/" + username + "/received/" + files[number - 1];
+      if (remove(path.c_str()) != 0) {
+        fprintf(stderr, "Cannot delete '%s': %s\n", path.c_str(),
+                strerror(errno));
+        error = "could not delete message";
+      }
+    }
+  } // lock released here, before answering the client
+  if (!error.empty()) {
+    return sendError(sock, "DEL", error);
   }
   return sendLine(sock, "OK");
 }
 
-void* clientCommunication(void* data) {
+// Maps the command line typed by the client to its enum value.
+Command parseCommand(const std::string& line) {
+  if (line == "SEND") return Command::SEND;
+  if (line == "READ") return Command::READ;
+  if (line == "LIST") return Command::LIST;
+  if (line == "DEL") return Command::DEL;
+  if (line == "QUIT") return Command::QUIT;
+  return Command::UNKNOWN;
+}
+
+// Checks which command 'line' is and calls the matching handler.
+// Returns false if the connection has to be closed (QUIT or connection gone).
+bool handleCommand(int sock, const std::string& line, std::string& pending) {
+  switch (parseCommand(line)) {
+    case Command::SEND:
+      return handleSend(sock, pending);
+    case Command::READ:
+      return handleRead(sock, pending);
+    case Command::LIST:
+      return handleList(sock, pending);
+    case Command::DEL:
+      return handleDel(sock, pending);
+    case Command::QUIT:
+      return false; // the server does not respond to QUIT
+    case Command::UNKNOWN:
+      break;
+  }
+  return sendLine(sock, "ERR"); // unknown command
+}
+
+// Runs in its own thread, one per connected client. Owns 'sock' and closes it.
+void clientCommunication(int sock) {
   char buffer[BUF];
-  int* current_socket = static_cast<int*>(data);
   // bytes received but not processed yet (belongs to this connection only)
   std::string pending;
   std::string line;
@@ -698,15 +801,16 @@ void* clientCommunication(void* data) {
   ////////////////////////////////////////////////////////////////////////////
   // SEND welcome message
   strcpy(buffer, "Welcome to myserver!\r\nPlease enter your commands...\r\n");
-  if (send(*current_socket, buffer, strlen(buffer), 0) == -1) {
+  if (send(sock, buffer, strlen(buffer), 0) == -1) {
     perror("send failed");
-    return nullptr;
+    close(sock);
+    return;
   }
 
   while (!abortRequested) {
     /////////////////////////////////////////////////////////////////////////
     // RECEIVE ONE COMMAND LINE
-    ReadResult result = readLine(*current_socket, pending, line);
+    ReadResult result = readLine(sock, pending, line);
     if (result == LINE_CLOSED) {
       printf("Client closed remote socket\n"); // ignore error
       break;
@@ -717,44 +821,18 @@ void* clientCommunication(void* data) {
 
     printf("Command received: %s\n", line.c_str()); // ignore error
 
-    if (line == "SEND") {
-      if (!handleSend(*current_socket, pending)) {
-        break;
-      }
-    } else if (line == "READ") {
-      if (!handleRead(*current_socket, pending)) {
-        break;
-      }
-    } else if (line == "LIST") {
-      if (!handleList(*current_socket, pending)) {
-        break;
-      }
-    } else if (line == "DEL") {
-      if (!handleDel(*current_socket, pending)) {
-        break;
-      }
-    } else if (line == "QUIT") {
-      break; // the server does not respond to QUIT
-    } else {
-      // unknown command
-      if (!sendLine(*current_socket, "ERR")) {
-        break;
-      }
+    if (!handleCommand(sock, line, pending)) {
+      break;
     }
   }
 
-  // closes/frees the descriptor if not already
-  if (*current_socket != -1) {
-    if (shutdown(*current_socket, SHUT_RDWR) == -1) {
-      perror("shutdown new_socket");
-    }
-    if (close(*current_socket) == -1) {
-      perror("close new_socket");
-    }
-    *current_socket = -1;
+  // closes/frees the descriptor
+  if (shutdown(sock, SHUT_RDWR) == -1) {
+    perror("shutdown client socket");
   }
-
-  return nullptr;
+  if (close(sock) == -1) {
+    perror("close client socket");
+  }
 }
 
 void signalHandler(int sig) {
